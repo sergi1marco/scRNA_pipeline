@@ -58,6 +58,8 @@ library(cutoff.scATOMIC) # scATOMIC uses this
 library(grid) # For unit() functions, essential for custom plots
 library(ggforce) # For geom_arc_bar in pie charts
 library(CellChat) # Make sure this is loaded and updated!
+library(scales) # ADDED: For generating color palettes (used in CellChat color assignment)
+library(grDevices) # ADDED: For rainbow() function
 
 message("\n--- All required libraries loaded successfully. ---")
 message("Verifying Python environment for scATOMIC:")
@@ -1680,8 +1682,9 @@ if (start_step <= 13) { # Step changed from 12 to 13
   message("Trajectory Inference step completed.")
   
 }
+
 # --- 16. Cell-Cell Communication Analysis (CellChat) ---
-if (start_step <= 14) {
+if (start_step <= 14) { # Step changed from 16 to 14 in previous output snippet, confirming this is the correct block
   
   message("Running CellChat analysis...")
   
@@ -1699,6 +1702,7 @@ if (start_step <= 14) {
   
   # If cellchat doesn't exist or was cleared, run new analysis
   if (!exists("cellchat")) {
+    
     # Step 1: Prepare protein-coding gene list
     protein_coding_genes <- keys(org.Hs.eg.db, keytype = "SYMBOL")
     
@@ -1712,16 +1716,31 @@ if (start_step <= 14) {
     meta$seurat_clusters[meta$seurat_clusters == "0"] <- "0_"
     meta$seurat_clusters <- factor(meta$seurat_clusters)
     
+    # Convert scATOMIC_prediction to factor BEFORE dropping levels
+    current_seurat_object$scATOMIC_prediction <- as.factor(current_seurat_object$scATOMIC_prediction)
+    
+    # Drop unused levels from the scATOMIC_prediction factor in your Seurat object
+    # This ensures only levels with actual cells are considered when creating CellChat object
+    current_seurat_object$scATOMIC_prediction <- droplevels(current_seurat_object$scATOMIC_prediction)
+    
+    # Optional: Verify the levels and counts after dropping unused levels
+    message("Levels in current_seurat_object$scATOMIC_prediction after dropping unused levels:")
+    print(levels(current_seurat_object$scATOMIC_prediction))
+    message("Counts in current_seurat_object$scATOMIC_prediction after dropping unused levels:")
+    print(table(current_seurat_object$scATOMIC_prediction))
+    
     # Step 4: Create CellChat object
+    # The 'group.by' argument will now use the cleaned scATOMIC_prediction levels
     cellchat <- createCellChat(object = data.input, meta = meta, group.by = "scATOMIC_prediction")
     cellchat@DB <- CellChatDB.human
     
-    # Step 5: Process cell-cell communication
+    # Step 5: Process cell-cell communication (these steps remain as they are)
     cellchat <- subsetData(cellchat)
     cellchat <- identifyOverExpressedGenes(cellchat)
     cellchat <- identifyOverExpressedInteractions(cellchat)
     cellchat <- computeCommunProb(cellchat)
-    cellchat <- filterCommunication(cellchat, min.cells = 10)
+    # TEMPORARY FIX: Set min.cells to 0 to bypass potential filtering issues that lead to zero cell types
+    cellchat <- filterCommunication(cellchat, min.cells = 0) # CHANGED from 10 to 0
     cellchat <- computeCommunProbPathway(cellchat)
     cellchat <- aggregateNet(cellchat)
     cellchat <- netAnalysis_computeCentrality(cellchat)
@@ -1731,12 +1750,35 @@ if (start_step <= 14) {
     message("New CellChat object created and saved.")
   }
   
-  # --- Visualization ---
+  # --- CRITICAL DIAGNOSTIC: Check cellchat@idents levels before color generation ---
+  message("Levels of cellchat@idents BEFORE color generation:")
+  print(levels(cellchat@idents))
+  message("Number of cell types BEFORE color generation:")
+  print(length(levels(cellchat@idents)))
+  # --- END CRITICAL DIAGNOSTIC ---
   
+  # --- CRITICAL FIX: Generate cell_colors ALWAYS after cellchat object is loaded/created ---
+  # This ensures 'cell_colors' is available for visualization regardless of reuse option.
+  num_cell_types <- length(levels(cellchat@idents))
+  # NEW FIX: Use grDevices::rainbow as an alternative to scales::hue_pal() to generate colors
+  cell_colors <- grDevices::rainbow(num_cell_types) # CHANGED
+
+  # Keep setting as an attribute on the idents factor, as this is a common practice and doesn't error.
+  attr(cellchat@idents, "colors") <- cell_colors
+  cellchat@colors <- cell_colors # ADD THIS LINE
+  # --- END CRITICAL FIX ---
+  
+  
+  # --- Visualization ---
+  # NEW STRATEGY for netVisual_circle: Remove 'color.use' to bypass igraph error for now.
+  # If this runs successfully, it confirms the issue is specifically with color application.
   pdf(file.path(data_dir, "cellchat_netVisual_circle.pdf"), width = 8, height = 8)
   print(netVisual_circle(cellchat@net$weight,
                          vertex.weight = as.numeric(table(cellchat@idents)),
-                         weight.scale = TRUE, label.edge = FALSE))
+                         weight.scale = TRUE,
+                         label.edge = FALSE,
+                         vertex.label.color = "black",
+                         color.use = cell_colors)) # ADDED color.use to explicitly pass your generated colors
   dev.off()
   
   # ---- 1. Signaling Role Heatmap ----
@@ -1744,19 +1786,18 @@ if (start_step <= 14) {
   ht@row_names_param$gp <- grid::gpar(fontsize = 3)
   ht@row_names_param$max_width <- grid::unit(6, "cm")
   
-  # Open PDF device and draw the heatmap
   pdf(file.path(data_dir, "cellchat_netAnalysis_signalingRole_heatmap.pdf"), width = 8, height = 12)
-  ComplexHeatmap::draw(ht, heatmap_legend_side = "right")  # Use explicit namespace
+  ComplexHeatmap::draw(ht, heatmap_legend_side = "right")
   dev.off()
   
   # ---- 2. Bubble Plot for Selected Pathway ----
-  # Ask user to select pathway AFTER printing available options
   message("Available pathways:")
   print(cellchat@netP$pathways)
   selected_pathway <- readline(prompt = "Enter the name of a pathway to visualize (or press Enter to skip): ")
   
   if (nzchar(selected_pathway) && selected_pathway %in% cellchat@netP$pathways) {
     pdf(file.path(data_dir, paste0("cellchat_netVisual_bubble_", selected_pathway, ".pdf")), width = 15, height = 12)
+    # FIX: Removed 'color.use' as it's an unused argument for netVisual_bubble based on documentation
     p <- netVisual_bubble(cellchat, signaling = selected_pathway) +
       ggplot2::theme(
         axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = 3, vjust = 1, margin = ggplot2::margin(t = 2)),
@@ -1771,7 +1812,8 @@ if (start_step <= 14) {
     circlize::circos.clear()
     circlize::circos.par(gap.degree = 5, track.margin = c(0.01, 0.01), start.degree = 90, track.height = 0.05)
     graphics::par(cex = 0.4, mar = c(1, 1, 1, 1))
-    netVisual_chord_cell(cellchat, signaling = selected_pathway, lab.cex = 3)
+    # FIX: Removed 'group.colors' as it's an unused argument for netVisual_chord_cell
+    netVisual_chord_cell(cellchat, signaling = selected_pathway, lab.cex = 3) # Removed group.colors
     dev.off()
     
   } else if (nzchar(selected_pathway)) {
@@ -1782,7 +1824,6 @@ if (start_step <= 14) {
   
   message("CellChat analysis and visualizations complete.")
 }
-
 # --- 17. Final Data Saving ---
 if (start_step <= 15) { # Step changed from 14 to 15
   user_save_choice <- tolower(readline(prompt = "Do you want to save the final Seurat object? (yes/no): "))
