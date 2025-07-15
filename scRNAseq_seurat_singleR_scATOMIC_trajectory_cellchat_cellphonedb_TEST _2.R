@@ -90,7 +90,7 @@ if (env_choice == 1) {
   cat("\n--- Initializing R session with scATOMIC/Rmagic Python environment ---\n")
 } else if (env_choice == 2) {
   python_env_path <- "C:/miniconda3/envs/cellphonedb_env/python.exe"
-  assign("CELLPHONEDB_PYTHON_PATH", python_env_path, envir = .GlobalEnv)
+  Sys.setenv('CELLPHONEDB_PYTHON_PATH' = python_env_path)
   cat("\n--- Initializing R session with CellPhoneDB Python environment ---\n")
 } else {
   stop("Invalid choice. Please restart your R session and enter 1 or 2.")
@@ -2480,103 +2480,237 @@ if (current_pipeline_step_marker >= start_step_numeric) {
 }
 current_pipeline_step_marker <- current_pipeline_step_marker + 1
 
-
 # --- 16. Cell-Cell Communication Analysis (CellChat) ---
 if (current_pipeline_step_marker >= start_step_numeric) {
+  message("--- Step ", current_pipeline_step_marker, ": Cell-Cell Communication Analysis (CellChat) ---")
   
-  message("--- Step ", current_pipeline_step_marker, ": Running CellChat analysis ---")
-  
-  # Check if CellChat object already exists locally
+  # Define file path for CellChat object
   cellchat_file <- file.path(data_dir, "cellchat_object.Rdata")
+  
+  # --- Control Flag for Analysis ---
+  # Initialize to assume new analysis is needed, unless loaded successfully
+  perform_new_analysis <- TRUE
+  cellchat <- NULL # Ensure cellchat is NULL initially
+  
+  # --- Decision: Load or Compute (Interactive Prompt for Reuse) ---
   if (file.exists(cellchat_file)) {
-    reuse <- tolower(readline(prompt = "CellChat object found. Do you want to reuse it? (yes/no): "))
-    if (reuse == "yes") {
-      load(cellchat_file)
-      message("Loaded existing CellChat object.")
+    # If the file exists, ask the user if they want to reuse it
+    reuse_input <- tolower(readline(prompt = "CellChat object found. Do you want to reuse it? (yes/no): "))
+    if (reuse_input == "yes") {
+      message("User chose to reuse existing CellChat object. Attempting to load...")
+      tryCatch({
+        load(cellchat_file) # This loads 'cellchat' into the environment
+        # Verify if 'cellchat' object is indeed loaded and not NULL
+        if (exists("cellchat") && !is.null(cellchat)) {
+          message("Successfully loaded existing CellChat object. Skipping ALL computation steps.")
+          perform_new_analysis <- FALSE # Set flag to skip new computation
+        } else {
+          message("Warning: 'cellchat' object not found or is NULL after loading. Proceeding with new analysis.")
+          perform_new_analysis <- TRUE # Force new analysis if load failed to provide 'cellchat'
+        }
+      }, error = function(e) {
+        message(paste("Error loading CellChat object:", e$message))
+        message("Proceeding with new analysis due to load error.")
+        perform_new_analysis <- TRUE # Force new analysis if load itself errors
+      })
     } else {
-      rm(list = c("cellchat"))  # Remove any previously loaded object before re-running
-      if (exists("cellchat")) message("Failed to remove old cellchat object, proceeding anyway.")
+      # If reuse_input is not "yes" (e.g., "no" or an empty string from a skipped readline)
+      message("User chose not to reuse existing CellChat object or input was skipped. Preparing for recomputation.")
+      perform_new_analysis <- TRUE # User explicitly wants to recompute or readline failed
+      # Clean up any residual 'cellchat' object if not reusing
+      if (exists("cellchat", inherits = FALSE)) {
+        rm(list = c("cellchat"))
+        message("Removed old 'cellchat' object from environment.")
+      }
     }
+  } else {
+    message("CellChat object file not found. A new analysis will be performed.")
+    # perform_new_analysis remains TRUE (default initial value)
   }
   
-  # If cellchat doesn't exist or was cleared, run new analysis
-  if (!exists("cellchat")) {
-    message("Running new CellChat analysis.")
+  # --- Perform CellChat Computation if 'perform_new_analysis' is TRUE ---
+  if (perform_new_analysis) {
+    message("Initiating CellChat computation steps.")
     
-    # Step 1: Prepare protein-coding gene list (ensure org.Hs.eg.db is loaded)
-    # This assumes org.Hs.eg.db is available and gene symbols are in rownames.
+    # Step 1: Prepare protein-coding gene list
     protein_coding_genes <- keys(org.Hs.eg.db, keytype = "SYMBOL")
     
     # Step 2: Extract normalized data for CellChat
-    # CellChat expects gene symbols in rownames and cells in colnames.
-    # The 'data' slot of the RNA assay contains log-normalized expression.
-    data.input <- GetAssayData(current_seurat_object, assay = "RNA", slot = "data")
-    
-    # Filter for protein-coding genes (if desired, based on org.Hs.eg.db)
+    data.input <- GetAssayData(current_seurat_object, assay = "RNA", layer = "data")
     data.input <- data.input[rownames(data.input) %in% protein_coding_genes, , drop = FALSE]
     
     # Step 3: Extract metadata and set 'scATOMIC_prediction' as the grouping variable
     meta <- current_seurat_object@meta.data
-    
-    # Ensure 'scATOMIC_prediction' is a factor and used as identity
     if (!("scATOMIC_prediction" %in% colnames(meta))) {
       stop("Metadata column 'scATOMIC_prediction' not found for CellChat grouping. Please check step 11.")
     }
-    
-    # Convert 'scATOMIC_prediction' to character, handle potential empty/NA values for CellChat robustness
     meta$cell_type_for_cellchat <- as.character(meta$scATOMIC_prediction)
     meta$cell_type_for_cellchat[is.na(meta$cell_type_for_cellchat) | meta$cell_type_for_cellchat == ""] <- "Unassigned"
     meta$cell_type_for_cellchat <- factor(meta$cell_type_for_cellchat)
     
-    # Create CellChat object
-    cellchat <- createCellChat(object = data.input, meta = meta, group.by = "cell_type_for_cellchat")
+    # FIX: Add the 'samples' column to meta BEFORE creating CellChat object
+    meta$samples <- current_seurat_object@meta.data$orig.ident
+    meta$samples <- as.factor(meta$samples)
+    
+    # --- Interactive selection of cell types for initial analysis (Computation) ---
+    message("\nAvailable cell types in your Seurat object for initial CellChat analysis computation:")
+    all_available_cell_types_for_computation <- levels(meta$cell_type_for_cellchat)
+    cell_type_counts_full <- table(meta$cell_type_for_cellchat) # Get counts for display
+    
+    for (i in seq_along(all_available_cell_types_for_computation)) {
+      cat(sprintf("%d. %s (%d cells)\n", i, all_available_cell_types_for_computation[i], cell_type_counts_full[all_available_cell_types_for_computation[i]]))
+    }
+    
+    selected_indices_input_computation <- readline(prompt = "Enter the numbers of cell types to include in CellChat analysis computation (e.g., '1,3,5' or '2-4'): ")
+    
+    selected_indices_computation <- unique(unlist(sapply(strsplit(selected_indices_input_computation, ",")[[1]], function(x) {
+      if (grepl("-", x)) {
+        range_vals <- as.numeric(strsplit(x, "-")[[1]])
+        return(seq(min(range_vals), max(range_vals)))
+      } else {
+        return(as.numeric(x))
+      }
+    })))
+    
+    if (length(selected_indices_computation) == 0 || any(selected_indices_computation < 1) || any(selected_indices_computation > length(all_available_cell_types_for_computation))) {
+      stop("Invalid or empty selection for CellChat analysis cell types. Please enter valid numbers.")
+    }
+    
+    selected_cell_types_for_computation <- all_available_cell_types_for_computation[selected_indices_computation]
+    cat("\nSelected cell types for CellChat computation:", paste(selected_cell_types_for_computation, collapse = ", "), "\n")
+    
+    # Filter the metadata and data.input for selected cell types for COMPUTATION
+    meta_filtered_for_computation <- meta[meta$cell_type_for_cellchat %in% selected_cell_types_for_computation, , drop = FALSE]
+    data.input_filtered_for_computation <- data.input[, rownames(meta_filtered_for_computation), drop = FALSE]
+    meta_filtered_for_computation$cell_type_for_cellchat <- droplevels(meta_filtered_for_computation$cell_type_for_cellchat)
+    
+    # Create CellChat object with the FILTERED data and metadata for initial computation
+    cellchat <- createCellChat(object = data.input_filtered_for_computation, meta = meta_filtered_for_computation, group.by = "cell_type_for_cellchat")
     
     # Set CellChat database (human)
-    CellChatDB <- CellChatDB.human # or CellChatDB.mouse if applicable
+    message("Loading CellChatDB.human database...")
+    data("CellChatDB.human", package = "CellChat")
+    CellChatDB <- CellChatDB.human
     cellchat@DB <- CellChatDB
     
     # Step 4: Preprocess and compute communication
-    cellchat <- subsetData(cellchat) # Filters out low expressed genes/cells
+    cellchat <- subsetData(cellchat)
     
-    # Parallel computing (adjust workers based on your CPU cores)
-    future::plan("multisession", workers = 4) # Adjust 'workers' as needed
+    # Parallel computing: SET TO SEQUENTIAL FOR MEMORY EFFICIENCY
+    future::plan("sequential")
     
     cellchat <- identifyOverExpressedGenes(cellchat)
     cellchat <- identifyOverExpressedInteractions(cellchat)
-    cellchat <- projectData(cellchat, CellChatDB)
+    
+    data("PPI.human") # Load PPI.human
+    
+    cellchat <- smoothData(cellchat, adj = PPI.human) # ADD adjMatrix argument to smoothData
     
     cellchat <- computeCommunProb(cellchat)
-    cellchat <- filterCommunication(cellchat, min.cells = 10) # Filter out infrequent interactions
+    cellchat <- filterCommunication(cellchat, min.cells = 10)
     cellchat <- computeCommunProbPathway(cellchat)
     cellchat <- aggregateNet(cellchat)
-    cellchat <- netAnalysis_computeCentrality(cellchat) # Compute centrality measures
+    cellchat <- netAnalysis_computeCentrality(cellchat)
     
     # Save CellChat object for reuse
     save(cellchat, file = cellchat_file)
     message("New CellChat object created and saved as 'cellchat_object.Rdata'.")
   }
   
+  # --- Ensure CellChat object is available for visualization ---
+  if (!exists("cellchat") || is.null(cellchat)) {
+    stop("Fatal Error: 'cellchat' object is not defined after load attempt or computation. Cannot proceed with visualization.")
+  }
+  
   # --- CellChat Visualization ---
   message("Generating CellChat visualizations...")
   
-  # --- Start of interactive CellChat plotting selection block (with cell counts) ---
+  # --- NEW: Generate an initial overview circle plot of all communications ---
+  message("Generating an overview circle plot of all cell-cell communications...")
+  pdf(file.path(data_dir, "cellchat_netVisual_circle_overview_all_interactions.pdf"), width = 10, height = 10)
+  print(netVisual_circle(cellchat@net$weight,
+                         vertex.weight = as.numeric(table(cellchat@idents)),
+                         weight.scale = TRUE, # Ensure stronger interactions have thicker edges
+                         label.edge = TRUE,   # Crucial: Labels edges with interaction names
+                         title.name = "Overview of All Cell-Cell Communication Strengths (Labeled)",
+                         edge.width.max = 8  # <-- REMOVED THE 'layout' ARGUMENT HERE
+  ))
+  dev.off()
+  message("Overview circle plot saved with labeled edges: 'cellchat_netVisual_circle_overview_all_interactions.pdf'")
   
-  # Get cell types (idents) from the existing CellChat object
-  cellchat_cell_types <- levels(cellchat@idents)
-  # Get cell counts for each cell type in the CellChat object
-  cell_type_counts <- table(cellchat@idents)
+  # --- NEW: Extract and sort all significant interactions in a detailed table ---
+  message("\nExtracting and sorting all significant cell-cell interactions with pathway and ligand-receptor details:")
   
-  cat("\nAvailable cell types in CellChat object for plotting:\n")
-  for (i in seq_along(cellchat_cell_types)) {
-    # Display cell type name and its count
-    cat(sprintf("%d. %s (%d cells)\n", i, cellchat_cell_types[i], cell_type_counts[cellchat_cell_types[i]]))
+  # Ensure dplyr is loaded for the %>% operator if not already
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    message("Installing dplyr for enhanced data manipulation...")
+    install.packages("dplyr")
+    library(dplyr)
+  } else {
+    library(dplyr) # Load dplyr if already installed
   }
   
-  # Interactively get user input for cell types to include in plots
-  selected_indices_input_cellchat_plot <- readline(prompt = "Enter the numbers of cell types to plot (e.g., '1,3,5' or '2-4'): ")
+  # Get the detailed communication results from CellChat
+  # This contains information for each inferred L-R pair and pathway
+  df.net <- subsetCommunication(cellchat)
   
-  # Parse the input
-  selected_indices_cellchat_plot <- unique(unlist(sapply(strsplit(selected_indices_input_cellchat_plot, ",")[[1]], function(x) {
+  # If df.net is empty (e.g., no significant communications found), handle it
+  if (nrow(df.net) == 0) {
+    message("No significant cell-cell communications found in the CellChat object.")
+    interactions_df_sorted <- data.frame(
+      Pathway = character(),
+      Ligand_Receptor = character(),
+      Sender = character(),
+      Receiver = character(),
+      Communication_Strength = numeric(),
+      P_value = numeric(),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    # Select relevant columns and rename for clarity
+    interactions_df <- df.net %>%
+      dplyr::select(
+        pathway_name, # The signaling pathway
+        interaction_name, # The ligand-receptor pair
+        source, # Sender cell type
+        target, # Receiver cell type
+        prob, # Communication probability (strength)
+        pval  # P-value for significance
+      ) %>%
+      dplyr::rename(
+        Pathway = pathway_name,
+        Ligand_Receptor = interaction_name,
+        Sender = source,
+        Receiver = target,
+        Communication_Strength = prob,
+        P_Value = pval # Renamed to match your requested output
+      )
+    
+    # Sort by Communication_Strength in descending order
+    interactions_df_sorted <- interactions_df[order(interactions_df$Communication_Strength, decreasing = TRUE), ]
+  }
+  
+  # Print the top 20 interactions to console for quick review
+  message("\nTop 20 Cell-Cell Communication Strengths (detailed):")
+  print(head(interactions_df_sorted, 20))
+  
+  # Save this detailed table to a CSV file for more detailed review
+  write.csv(interactions_df_sorted, file.path(data_dir, "cellchat_detailed_interactions_sorted_by_strength.csv"), row.names = FALSE)
+  message(paste0("Detailed significant cell-cell interactions saved to: ", file.path(data_dir, "cellchat_detailed_interactions_sorted_by_strength.csv")))
+  
+  
+  # --- Interactive selection of cell types for PLOTTING (always runs) ---
+  message("\nAvailable cell types in the CellChat object for plotting:")
+  all_available_cell_types_for_plotting <- levels(cellchat@idents)
+  cell_type_counts_plotting <- table(cellchat@idents) # Get counts for display
+  
+  for (i in seq_along(all_available_cell_types_for_plotting)) {
+    cat(sprintf("%d. %s (%d cells)\n", i, all_available_cell_types_for_plotting[i], cell_type_counts_plotting[all_available_cell_types_for_plotting[i]]))
+  }
+  
+  selected_indices_input_plotting <- readline(prompt = "Enter the numbers of cell types to INCLUDE in the plots (e.g., '1,3,5' or '2-4'): ")
+  
+  selected_indices_plotting <- unique(unlist(sapply(strsplit(selected_indices_input_plotting, ",")[[1]], function(x) {
     if (grepl("-", x)) {
       range_vals <- as.numeric(strsplit(x, "-")[[1]])
       return(seq(min(range_vals), max(range_vals)))
@@ -2585,92 +2719,105 @@ if (current_pipeline_step_marker >= start_step_numeric) {
     }
   })))
   
-  # Validate input indices
-  if (any(selected_indices_cellchat_plot < 1) || any(selected_indices_cellchat_plot > length(cellchat_cell_types))) {
-    stop("Invalid selection. Please enter numbers corresponding to the listed cell types.")
+  # Default to plotting all cell types if invalid/empty selection
+  if (length(selected_indices_plotting) == 0 || any(selected_indices_plotting < 1) || any(selected_indices_plotting > length(all_available_cell_types_for_plotting))) {
+    message("Invalid or empty selection for plotting cell types. Plotting ALL available cell types in the object.")
+    selected_cell_types_for_plotting <- all_available_cell_types_for_plotting
+  } else {
+    selected_cell_types_for_plotting <- all_available_cell_types_for_plotting[selected_indices_plotting]
+    cat("\nSelected cell types for plotting:", paste(selected_cell_types_for_plotting, collapse = ", "), "\n")
   }
   
-  # Get the names of the selected cell types for plotting
-  selected_cell_types_for_plotting <- cellchat_cell_types[selected_indices_cellchat_plot]
-  cat("\nSelected cell types for CellChat plots:", paste(selected_cell_types_for_plotting, collapse = ", "), "\n")
+  # Create a subsetted CellChat object for plotting ONLY if selection was made and it's a subset
+  cellchat_for_plotting <- cellchat
+  if (length(selected_cell_types_for_plotting) < length(all_available_cell_types_for_plotting)) {
+    message("Subsetting CellChat object for selected plotting cell types...")
+    cellchat_for_plotting <- subsetCellChat(cellchat, idents.use = selected_cell_types_for_plotting)
+    message("Re-computing net and centrality for subsetted CellChat object for plotting.")
+    cellchat_for_plotting <- aggregateNet(cellchat_for_plotting)
+    cellchat_for_plotting <- netAnalysis_computeCentrality(cellchat_for_plotting)
+  }
   
-  # --- NEW: Subset the CellChat object for plotting ---
-  # This creates a new CellChat object containing only the selected cell types
-  cellchat_filtered_for_plotting <- subsetCellChat(cellchat, idents.use = selected_cell_types_for_plotting)
-  
-  # Recompute aggregated networks for the subsetted object if needed by plots
-  # (Often subsetCellChat handles this, but sometimes explicit re-aggregation is safer)
-  # cellchat_filtered_for_plotting <- aggregateNet(cellchat_filtered_for_plotting)
-  # cellchat_filtered_for_plotting <- netAnalysis_computeCentrality(cellchat_filtered_for_plotting)
-  
-  # --- End of interactive CellChat plotting selection block (with cell counts) ---
-  
-  
+  # --- CellChat plotting uses the 'cellchat_for_plotting' object ---
   # NetVisual Circle Plot (overall communication)
-  pdf(file.path(data_dir, "cellchat_netVisual_circle_selected_types.pdf"), width = 8, height = 8)
-  # Use the filtered CellChat object's net$weight
-  print(netVisual_circle(cellchat_filtered_for_plotting@net$weight, # <-- MODIFICATION HERE (using filtered object's weight)
-                         vertex.weight = as.numeric(table(cellchat_filtered_for_plotting@idents)), # <-- MODIFICATION HERE (using filtered object's idents)
+  pdf(file.path(data_dir, "cellchat_netVisual_circle_filtered_plot.pdf"), width = 8, height = 8)
+  print(netVisual_circle(cellchat_for_plotting@net$weight,
+                         vertex.weight = as.numeric(table(cellchat_for_plotting@idents)),
                          weight.scale = TRUE, label.edge = FALSE,
-                         title.name = "Overall Communication Strength (Selected Cell Types)"))
+                         title.name = paste("Overall Communication Strength (Selected Cell Types) -", paste(selected_cell_types_for_plotting, collapse = ", "))))
   dev.off()
   message("CellChat overall communication circle plot saved for selected cell types.")
   
   # Signaling Role Heatmap
-  # Use the filtered CellChat object for netAnalysis_signalingRole_heatmap
-  ht <- netAnalysis_signalingRole_heatmap(cellchat_filtered_for_plotting)
-  ht@row_names_param$gp <- grid::gpar(fontsize = 4) # Keep or adjust fontsize (e.g., 2.5, 3.5)
-  ht@row_names_param$max_width <- grid::unit(8, "cm") # Keep or adjust for longer names
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_for_plotting)
+  ht@row_names_param$gp <- grid::gpar(fontsize = 4)
+  ht@row_names_param$max_width <- grid::unit(8, "cm")
   
-  pdf(file.path(data_dir, "cellchat_netAnalysis_signalingRole_heatmap_selected_types.pdf"), width = 8, height = 80) # Keep or adjust PDF height as needed
+  pdf(file.path(data_dir, "cellchat_netAnalysis_signalingRole_heatmap_filtered_plot.pdf"), width = 8, height = 80)
   ComplexHeatmap::draw(ht,
                        heatmap_legend_side = "right",
-                       heatmap_height = grid::unit(200, "cm")) # <-- MODIFIED: Using absolute unit (cm)
+                       heatmap_height = grid::unit(200, "cm"))
   dev.off()
   message("CellChat signaling role heatmap saved for selected cell types.")
   
-  # Bubble Plot for Selected Pathway (Interactive)
-  message("Available pathways for CellChat visualization:")
-  # Get pathways from the filtered object, as some might be lost if no cells in selected group support them
-  print(cellchat_filtered_for_plotting@netP$pathways) # <-- MODIFICATION HERE (using filtered object)
-  selected_pathway <- readline(prompt = "Enter the name of a specific CellChat pathway to visualize (e.g., 'VEGF', 'TGFb') or press Enter to skip pathway-specific plots: ")
-  
-  # Check if selected pathway is in the pathways of the filtered object
-  if (nzchar(selected_pathway) && selected_pathway %in% cellchat_filtered_for_plotting@netP$pathways) { # <-- MODIFICATION HERE
-    message(paste0("Generating CellChat bubble plot for pathway: ", selected_pathway))
-    pdf(file.path(data_dir, paste0("cellchat_netVisual_bubble_", selected_pathway, "_selected_types.pdf")), width = 15, height = 12) # Added suffix
-    # Use the filtered CellChat object for netVisual_bubble
-    p_bubble <- netVisual_bubble(cellchat_filtered_for_plotting, # <-- MODIFICATION HERE (using filtered object)
-                                 signaling = selected_pathway,
-                                 remove.isolate = FALSE) +
-      ggplot2::theme(
-        axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = 8, vjust = 1, margin = ggplot2::margin(t = 2)),
-        axis.text.y = ggplot2::element_text(size = 8),
-        plot.title = ggplot2::element_text(hjust = 0.5, face = "bold")
-      ) +
-      ggplot2::ggtitle(paste0("CellChat Communication Probabilities: ", selected_pathway, " Pathway (Selected Cell Types)")) # Added suffix
-    print(p_bubble)
-    dev.off()
-    message(paste0("CellChat bubble plot for '", selected_pathway, "' saved for selected cell types."))
+  # --- Loop for Pathway-Specific Plotting (Interactive) ---
+  repeat {
+    message("\nAvailable pathways for CellChat visualization:")
     
-    # Chord Plot for Selected Pathway
-    message(paste0("Generating CellChat chord plot for pathway: ", selected_pathway))
-    pdf(file.path(data_dir, paste0("cellchat_netVisual_chord_", selected_pathway, "_selected_types.pdf")), width = 14, height = 14) # Added suffix
-    circlize::circos.clear()
-    circlize::circos.par(gap.degree = 5, track.margin = c(0.01, 0.01), start.degree = 90, track.height = 0.05)
-    graphics::par(cex = 0.4, mar = c(1, 1, 1, 1)) # Adjust margins for the plot
-    # Use the filtered CellChat object for netVisual_chord_cell
-    netVisual_chord_cell(cellchat_filtered_for_plotting, # <-- MODIFICATION HERE (using filtered object)
-                         signaling = selected_pathway,
-                         lab.cex = 3) # lab.cex adjusts label size
-    dev.off()
-    message(paste0("CellChat chord plot for '", selected_pathway, "' saved for selected cell types."))
+    # Use the 'cellchat_for_plotting' object to ensure pathways are relevant to selected cell types
+    available_pathways <- sort(cellchat_for_plotting@netP$pathways)
+    if (length(available_pathways) == 0) {
+      message("No pathways available for visualization in the current CellChat object (or selected cell types).")
+      break # Exit the loop if no pathways are available
+    }
+    print(available_pathways)
     
-  } else if (nzchar(selected_pathway)) {
-    warning(paste0("Selected CellChat pathway '", selected_pathway, "' not found in available pathways. Skipping pathway visualizations."))
-  } else {
-    message("No CellChat pathway selected, skipping pathway visualizations.")
-  }
+    selected_pathway <- readline(prompt = "Enter the name of a specific CellChat pathway to visualize (e.g., 'VEGF', 'TGFb') or type 'done' to finish pathway plots: ")
+    
+    if (tolower(selected_pathway) == "done") {
+      message("Finishing pathway visualizations.")
+      break # Exit the loop
+    } else if (nzchar(selected_pathway) && selected_pathway %in% available_pathways) {
+      message(paste0("Generating CellChat bubble plot for pathway: ", selected_pathway))
+      pdf(file.path(data_dir, paste0("cellchat_netVisual_bubble_", selected_pathway, "_filtered_plot.pdf")), width = 15, height = 12)
+      p_bubble <- netVisual_bubble(cellchat_for_plotting,
+                                   signaling = selected_pathway,
+                                   remove.isolate = FALSE) +
+        ggplot2::theme(
+          axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = 8, vjust = 1, margin = ggplot2::margin(t = 2)),
+          axis.text.y = ggplot2::element_text(size = 8),
+          plot.title = ggplot2::element_text(hjust = 0.5, face = "bold")
+        ) +
+        ggplot2::ggtitle(paste0("CellChat Communication Probabilities: ", selected_pathway, " Pathway (Selected Cell Types)"))
+      print(p_bubble)
+      dev.off()
+      message(paste0("CellChat bubble plot for '", selected_pathway, "' saved for selected cell types."))
+      
+      # Chord Plot for Selected Pathway
+      message(paste0("Generating CellChat chord plot for pathway: ", selected_pathway))
+      pdf(file.path(data_dir, paste0("cellchat_netVisual_chord_", selected_pathway, "_filtered_plot.pdf")), width = 14, height = 14)
+      circlize::circos.clear()
+      circlize::circos.par(gap.degree = 5, track.margin = c(0.01, 0.01), start.degree = 90, track.height = 0.5)
+      graphics::par(cex = 0.4, mar = c(1, 1, 1, 1))
+      netVisual_chord_cell(cellchat_for_plotting,
+                           signaling = selected_pathway,
+                           lab.cex = 3)
+      dev.off()
+      message(paste0("CellChat chord plot for '", selected_pathway, "' saved for selected cell types."))
+      
+      # After plotting, ask if they want to plot another pathway
+      continue_plotting <- tolower(readline(prompt = "Pathway plots complete. Do you want to plot another pathway? (yes/no): "))
+      if (continue_plotting != "yes") {
+        message("User chose not to plot more pathways.")
+        break # Exit the loop
+      }
+      
+    } else if (nzchar(selected_pathway)) {
+      warning(paste0("Selected CellChat pathway '", selected_pathway, "' not found in available pathways for the selected cell types. Please try again or type 'done' to finish."))
+    } else {
+      message("No pathway selected. Please enter a pathway name, or type 'done' to finish pathway plots.")
+    }
+  } # End of repeat loop for pathway plotting
   
   message("CellChat analysis and visualizations complete.")
 }
@@ -2930,6 +3077,14 @@ means_df <- read.delim(means_file_out, sep = "\t", header = TRUE, check.names = 
 pvalues_df <- read.delim(pvalues_file_out, sep = "\t", header = TRUE, check.names = FALSE)
 deconvoluted_df <- read.delim(deconvoluted_file_out, sep = "\t", header = TRUE, check.names = FALSE)
 cat("Files loaded successfully.\n")
+
+# --- CRITICAL FIX: Ensure means_df and pvalues_df column names are character ---
+# This addresses potential 'non-character argument' errors from ktplots by
+# ensuring the column names (which represent cell pairs) are explicitly character.
+message("Ensuring means_df and pvalues_df column names are character type...")
+colnames(means_df) <- as.character(colnames(means_df))
+colnames(pvalues_df) <- as.character(colnames(pvalues_df))
+message("Column names conversion complete.")
 
 metadata_cols_to_exclude <- c(
   "id_cp_interaction", "interacting_pair", "partner_a", "partner_b",
@@ -3323,7 +3478,7 @@ tryCatch({
   cat(paste0("Error generating Network Plot: ", e$message, "\n"))
 })
 
-
+# --- Chord Plot Generation Section ---
 cat("Generating Chord Plot using ktplots::plot_cpdb4...\n")
 
 plot_filename_chord <- file.path(cellphonedb_output_dir, "cellphonedb_chord_plot.pdf")
@@ -3350,46 +3505,154 @@ if (is.null(assay(sce_object, "logcounts"))) {
 # Generate all possible cell pairs as before
 cell_pairs <- as.vector(outer(chosen_cell_types, chosen_cell_types, paste, sep = "|"))
 
-# Get available pairs present in all three data frames
-available_pairs <- intersect(
-  intersect(colnames(means_df), colnames(pvalues_df)),
-  colnames(deconvoluted_df)
-)
-available_pairs <- available_pairs[grepl("\\|", available_pairs)]
+# Get available pairs present in means_df and pvalues_df.
+available_pairs <- intersect(colnames(means_df), colnames(pvalues_df))
+available_pairs <- available_pairs[grepl("\\|", available_pairs)] # Ensure they are interaction pairs
 
-# Warn about missing pairs in deconvoluted_df
-missing_in_deconv <- setdiff(cell_pairs, colnames(deconvoluted_df))
-if(length(missing_in_deconv) > 0) {
-  cat("Warning: The following cell pairs are missing in deconvoluted_df and will be skipped:\n")
-  print(missing_in_deconv)
+# Extract unique interacting_pairs from plot_df_significant that are also in means_df
+interaction_vector <- unique(as.character(plot_df_significant$interacting_pair[plot_df_significant$interacting_pair %in% means_df$interacting_pair]))
+
+# --- NEW FILTERING STEP FOR INTERACTION_VECTOR ---
+# This ensures that both ligand and receptor/complex components exist in deconvoluted_df's 'gene_name' column.
+filtered_interaction_vector <- character(0)
+deconv_gene_ids <- unique(deconvoluted_df$gene_name) # Get all available gene/complex IDs from deconvoluted_df
+
+cat("\n--- Filtering interactions based on presence of components in 'deconvoluted_df' ---\n")
+for (i_pair in interaction_vector) {
+  parts <- unlist(strsplit(i_pair, "_", fixed = TRUE))
+  ligand <- parts[1]
+  receptor_complex <- if (length(parts) > 1) paste(parts[2:length(parts)], collapse = "_") else ""
+  
+  if (ligand %in% deconv_gene_ids && receptor_complex %in% deconv_gene_ids) {
+    filtered_interaction_vector <- c(filtered_interaction_vector, i_pair)
+  } else {
+    if (!(ligand %in% deconv_gene_ids)) {
+      message(paste0("Skipping interaction '", i_pair, "' because ligand '", ligand, "' is missing from 'deconvoluted_df$gene_name'."))
+    }
+    if (receptor_complex != "" && !(receptor_complex %in% deconv_gene_ids)) {
+      message(paste0("Skipping interaction '", i_pair, "' because receptor/complex '", receptor_complex, "' is missing from 'deconvoluted_df$gene_name'."))
+    }
+  }
+}
+interaction_vector <- filtered_interaction_vector # Update interaction_vector with the filtered list
+
+if (length(interaction_vector) == 0) {
+  message("WARNING: No specific interactions remain after filtering for components present in 'deconvoluted_df'. The Chord Plot will show only cell-cell type connections without specific interaction ribbons for named interactions.")
+} else {
+  message(paste0("After filtering for deconvoluted_df components, ", length(interaction_vector), " interactions remain for Chord Plotting."))
+}
+cat("--- Finished filtering interactions ---\n")
+# --- END NEW FILTERING STEP ---
+
+# Only plot if valid pairs exist from means_df and pvalues_df
+valid_pairs <- cell_pairs[cell_pairs %in% available_pairs]
+
+if(length(valid_pairs) == 0) {
+  stop("No valid cell pairs found in 'means_df' and 'pvalues_df' after filtering. Check your CellPhoneDB output files or 'chosen_cell_types'.")
+} else {
+  cat(paste0("Found ", length(valid_pairs), " common cell pairs for Chord Plotting.\n"))
 }
 
-# Filter interaction_vector to only those present in means_df and available_pairs
-interaction_vector <- as.character(plot_df_significant$interacting_pair)
-interaction_vector <- interaction_vector[interaction_vector %in% means_df$interacting_pair]
+# --- CRITICAL NEW STEP: Filter deconvoluted_df based on interaction_vector and relevant genes ---
+# This step creates a deconvoluted_df that ktplots can work with.
+# It ensures that only rows relevant to the 'interaction_vector' are kept,
+# and more importantly, that the 'gene_name' column matches the ligand/receptor names
+# that ktplots will try to look up for drawing ribbons.
 
-# Only plot if valid pairs exist
-valid_pairs <- cell_pairs[cell_pairs %in% available_pairs]
-if(length(valid_pairs) == 0) stop("No valid cell pairs present in all data frames.")
+# Extract all unique ligand/receptor/complex names from the FINAL interaction_vector
+all_components_in_interactions <- unique(unlist(strsplit(interaction_vector, "_", fixed = TRUE)))
 
+# Filter deconvoluted_df to include only relevant 'gene_name' entries.
+# This assumes 'gene_name' in deconvoluted_df corresponds to the ligand/receptor/complex names
+# found in the 'interacting_pair' column of means/pvalues/interaction_vector.
+deconvoluted_df_filtered <- deconvoluted_df %>%
+  dplyr::filter(gene_name %in% all_components_in_interactions)
+
+# Also ensure column names are character for deconvoluted_df, if not already done.
+# This is for robustness, similar to means_df and pvalues_df.
+colnames(deconvoluted_df_filtered) <- as.character(colnames(deconvoluted_df_filtered))
+
+# Diagnostic for deconvoluted_df_filtered
+message("Dimensions of deconvoluted_df_filtered (after pre-filtering for plotting): ", paste(dim(deconvoluted_df_filtered), collapse = "x"))
+if (nrow(deconvoluted_df_filtered) == 0 && length(interaction_vector) > 0) {
+  message("WARNING: deconvoluted_df_filtered is empty but interactions are present. This might still cause issues with ribbon drawing in ktplots.")
+}
+# --- END CRITICAL NEW STEP ---
+
+
+# --- DIAGNOSTIC CHECKS BEFORE PLOTTING ---
+message("\n--- Running Pre-Plotting Diagnostic Checks ---")
+message("Dimensions of means_df: ", paste(dim(means_df), collapse = "x"))
+message("Dimensions of pvalues_df: ", paste(dim(pvalues_df), collapse = "x"))
+message("Dimensions of deconvoluted_df: ", paste(dim(deconvoluted_df), collapse = "x")) # Original
+message("Dimensions of deconvoluted_df_filtered: ", paste(dim(deconvoluted_df_filtered), collapse = "x")) # Filtered
+message("Dimensions of logcounts(sce_object): ", paste(dim(logcounts(sce_object)), collapse = "x"))
+message("Number of unique cell types in sce_object: ", length(levels(sce_object$scATOMIC_prediction)))
+message("First few entries of interaction_vector: ", paste(head(interaction_vector), collapse = ", "))
+message("Number of entries in interaction_vector: ", length(interaction_vector))
+
+# Deep Dive Diagnostic Checks for Chord Plot Inputs
+message("\n--- Deep Dive Diagnostic Checks for Chord Plot Inputs ---")
+message("Class of chosen_cell_types: ", class(chosen_cell_types))
+# The chosen_cell_types_char is defined inside the tryCatch, so this check will show 'chosen_cell_types' class.
+message("Class of means_df$interacting_pair: ", class(means_df$interacting_pair))
+message("Class of pvalues_df$interacting_pair: ", class(pvalues_df$interacting_pair))
+
+# Check class of a sample cell pair column in means_df (e.g., first cell pair column)
+cell_pair_cols_means <- colnames(means_df)[grepl("\\|", colnames(means_df))]
+if (length(cell_pair_cols_means) > 0) {
+  first_cell_pair_col_means <- cell_pair_cols_means[1]
+  message(paste0("Class of sample cell pair column ('", first_cell_pair_col_means, "') in means_df: ", class(means_df[[first_cell_pair_col_means]])))
+} else {
+  message("No cell pair columns found in means_df (or no data).")
+}
+
+cell_pair_cols_pvals <- colnames(pvalues_df)[grepl("\\|", colnames(pvalues_df))]
+if (length(cell_pair_cols_pvals) > 0) {
+  first_cell_pair_col_pvals <- cell_pair_cols_pvals[1]
+  message(paste0("Class of sample cell pair column ('", first_cell_pair_col_pvals, "') in pvalues_df: ", class(pvalues_df[[first_cell_pair_col_pvals]])))
+} else {
+  message("No cell pair columns found in pvalues_df (or no data).")
+}
+
+# Check deconvoluted_df_filtered
+message("Class of deconvoluted_df_filtered$gene_name: ", class(deconvoluted_df_filtered$gene_name))
+if (nrow(deconvoluted_df_filtered) > 0) {
+  message("First few deconvoluted_df_filtered$gene_name: ", paste(head(deconvoluted_df_filtered$gene_name), collapse = ", "))
+} else {
+  message("deconvoluted_df_filtered is empty.")
+}
+
+message("--- End Deep Dive Diagnostic Checks ---\n")
+message("--- End Pre-Plotting Diagnostic Checks ---\n")
+# --- END DIAGNOSTIC CHECKS ---
+
+# --- Chord Plot Generation tryCatch Block ---
 tryCatch({
   cat(paste0("Attempting to save Chord Plot to: '", plot_filename_chord, "'\n"))
+  
+  # Ensure chosen_cell_types is a character vector for ktplots
+  chosen_cell_types_char <- as.character(chosen_cell_types)
+  
+  # Set interaction_to_pass to NULL if interaction_vector is empty,
+  # otherwise use the filtered interaction_vector.
+  interaction_to_pass <- if (length(interaction_vector) == 0) NULL else interaction_vector
+  
   cpdb_chord_plot <- ktplots::plot_cpdb4(
     scdata = sce_object,
     celltype_key = "scATOMIC_prediction",
-    cell_type1 = "scATOMIC_prediction",
-    cell_type2 = "scATOMIC_prediction",
+    cell_type1 = chosen_cell_types_char,
+    cell_type2 = chosen_cell_types_char,
     means = means_df,
     pvals = pvalues_df,
-    deconvoluted = deconvoluted_df,
-    interaction = interaction_vector
+    deconvoluted = deconvoluted_df_filtered, # Pass the filtered deconvoluted_df here
+    interaction = interaction_to_pass
   )
   ggsave(plot_filename_chord, cpdb_chord_plot, width = 12, height = 10)
   cat(paste0("Chord plot saved to: '", plot_filename_chord, "'\n"))
 }, error = function(e) {
   cat("Error generating Chord Plot: ", e$message, "\n")
 })
-
 
 cat("All CellPhoneDB analysis and plotting steps complete.\n")
 # --- 17. Final Data Saving ---
